@@ -533,9 +533,10 @@ export const runAgent = createServerFn({ method: "POST" })
       confidence: number;
       action: string;
       fill_status: string;
+      options: string[];
     };
 
-    const rows: Row[] = page.fields.map((field) => {
+    const rows: Row[] = fields.map((field) => {
       const guess = bySelector.get(field.selector);
       const isFileField = field.type === "file";
       let value = guess?.value?.trim() || null;
@@ -571,7 +572,9 @@ export const runAgent = createServerFn({ method: "POST" })
         confidence = 0;
       }
 
-      const action = value && confidence >= 80 ? "fill" : field.required || value === null ? "ask_user" : "skip";
+      // Every column on the form gets a value: fill whatever we genuinely know,
+      // and ask about anything left blank — required or not — so nothing is skipped.
+      const action = value && confidence >= 50 ? "fill" : "ask_user";
 
       return {
         user_id: userId,
@@ -586,6 +589,7 @@ export const runAgent = createServerFn({ method: "POST" })
         confidence,
         action,
         fill_status: "pending",
+        options: field.options ?? [],
       };
     });
 
@@ -606,21 +610,26 @@ export const runAgent = createServerFn({ method: "POST" })
 
     /* ---- questions for anything unknown */
     if (asks.length > 0) {
+      const optionsByLabel = new Map<string, string[]>(
+        fields.map((field) => [field.label, (field.options ?? []).filter(Boolean)]),
+      );
       await supabase.from("pending_questions").insert(
-        asks.map((row: any) => ({
-          user_id: userId,
-          application_id: applicationId,
-          field_mapping_id: row.id,
-          kind: isSensitive(row.field_label) ? "sensitive" : "missing_info",
-          question: row.field_label,
-          input_type:
-            row.field_type === "textarea"
-              ? "textarea"
-              : row.field_type === "checkbox" || row.field_type === "radio"
-                ? "choice"
-                : "text",
-          options: row.field_type === "checkbox" || row.field_type === "radio" ? ["Yes", "No"] : [],
-        })),
+        asks.map((row: any) => {
+          const fieldOptions = (optionsByLabel.get(row.field_label) ?? []).filter(
+            (option) => !/^(select|choose|please select|--)/i.test(option),
+          );
+          const isChoice =
+            fieldOptions.length > 0 || row.field_type === "checkbox" || row.field_type === "radio";
+          return {
+            user_id: userId,
+            application_id: applicationId,
+            field_mapping_id: row.id,
+            kind: isSensitive(row.field_label) ? "sensitive" : "missing_info",
+            question: row.field_label,
+            input_type: row.field_type === "textarea" ? "textarea" : isChoice ? "choice" : "text",
+            options: fieldOptions.length > 0 ? fieldOptions.slice(0, 30) : isChoice ? ["Yes", "No"] : [],
+          };
+        }),
       );
       await setStep(supabase, applicationId, "HANDLE_MISSING_INFORMATION", "waiting", `${asks.length} answers needed`);
       await supabase

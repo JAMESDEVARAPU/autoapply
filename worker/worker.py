@@ -102,6 +102,60 @@ class Api:
         return target
 
 
+EXTRACT_FIELDS_JS = r"""
+() => {
+  const clean = (s) => (s || "").replace(/\s+/g, " ").trim();
+  const labelFor = (el) => {
+    if (el.id) {
+      const label = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+      if (label) return clean(label.textContent);
+    }
+    const aria = el.getAttribute("aria-label");
+    if (aria) return clean(aria);
+    let parent = el.parentElement;
+    for (let depth = 0; parent && depth < 4; depth += 1) {
+      const label = parent.querySelector("label, legend");
+      if (label) {
+        const value = clean(label.textContent);
+        if (value) return value;
+      }
+      parent = parent.parentElement;
+    }
+    return clean(el.getAttribute("placeholder") || el.getAttribute("name") || el.id || "Unlabelled field");
+  };
+  const selectorFor = (el, index) => {
+    if (el.id) return `#${CSS.escape(el.id)}`;
+    const name = el.getAttribute("name");
+    if (name) return `${el.tagName.toLowerCase()}[name="${name}"]`;
+    return `${el.tagName.toLowerCase()}:nth-of-type(${index + 1})`;
+  };
+  const fields = [];
+  const seen = new Set();
+  document.querySelectorAll("input, select, textarea").forEach((el, index) => {
+    const tag = el.tagName.toLowerCase();
+    const rawType = (el.getAttribute("type") || "").toLowerCase();
+    if (tag === "input" && ["hidden", "submit", "button", "reset", "image"].includes(rawType)) return;
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0 && rawType !== "file") return;
+    const type = tag === "textarea" ? "textarea"
+      : tag === "select" ? (el.multiple ? "multiselect" : "select")
+      : rawType || "text";
+    let label = labelFor(el);
+    const selector = selectorFor(el, index);
+    const key = `${type}::${label}::${selector}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    const required = el.required || el.getAttribute("aria-required") === "true" || /\*\s*$/.test(label);
+    const options = tag === "select"
+      ? Array.from(el.querySelectorAll("option")).map((o) => clean(o.textContent)).filter(Boolean).slice(0, 40)
+      : [];
+    fields.push({ label: label.replace(/\s*\*\s*$/, "").slice(0, 200), selector, type, required, options });
+  });
+  return fields.slice(0, 120);
+}
+"""
+
+
 def step(api: Api, application_id: str, state: str, status: str, detail: str | None = None) -> None:
     api.patch(
         "run_steps",
@@ -135,16 +189,34 @@ def looks_like_otp(page: Page) -> bool:
     )
 
 
+def best_option(value: str, options: list[str]) -> str | None:
+    """Pick the option on the page that matches the approved value most closely."""
+    wanted = value.strip().lower()
+    for option in options:
+        if option.strip().lower() == wanted:
+            return option
+    for option in options:
+        text = option.strip().lower()
+        if text and (text in wanted or wanted in text):
+            return option
+    return None
+
+
 def fill_field(page: Page, mapping: dict[str, Any], resume_path: str | None) -> tuple[bool, str | None]:
     selector = mapping["field_selector"]
     field_type = mapping["field_type"]
     value = mapping.get("mapped_value")
+    options = [o for o in (mapping.get("options") or []) if isinstance(o, str)]
 
     try:
         locator = page.locator(selector).first
         if locator.count() == 0:
             locator = page.get_by_label(mapping["field_label"], exact=False).first
         locator.wait_for(state="visible", timeout=8000)
+        try:
+            locator.scroll_into_view_if_needed(timeout=3000)
+        except Exception:
+            pass
 
         if field_type == "file":
             if not resume_path:
@@ -153,19 +225,44 @@ def fill_field(page: Page, mapping: dict[str, Any], resume_path: str | None) -> 
             return True, None
         if value is None:
             return False, "no approved value"
+
         if field_type in ("select", "multiselect"):
-            locator.select_option(label=value)
+            page_options = [
+                (o or "").strip()
+                for o in locator.locator("option").all_inner_texts()
+            ]
+            match = best_option(value, page_options or options)
+            try:
+                locator.select_option(label=match or value)
+            except Exception:
+                locator.select_option(value=match or value)
             return True, None
+
         if field_type == "checkbox":
-            if value.strip().lower() in ("yes", "true", "1", "on"):
+            if value.strip().lower() in ("yes", "true", "1", "on", "i agree", "agree", "accept"):
                 locator.check()
             else:
                 locator.uncheck()
             return True, None
+
         if field_type == "radio":
-            page.get_by_role("radio", name=value, exact=False).first.check()
+            try:
+                page.get_by_role("radio", name=value, exact=False).first.check()
+            except Exception:
+                match = best_option(value, options) or value
+                page.get_by_text(match, exact=False).first.click()
             return True, None
+
         locator.fill(value)
+        # Autocomplete / combobox inputs only commit once a suggestion is chosen.
+        if options or locator.get_attribute("role") == "combobox" or locator.get_attribute("aria-autocomplete"):
+            page.wait_for_timeout(900)
+            suggestion = page.locator("[role=option], li[role=option], .select__option").first
+            if suggestion.count() > 0:
+                try:
+                    suggestion.click()
+                except Exception:
+                    locator.press("Enter")
         return True, None
     except PWTimeout:
         return False, "field not found on the live page"
@@ -201,7 +298,7 @@ def process(api: Api, page: Page, application: dict[str, Any]) -> None:
     step(api, application_id, "FILL_FIELDS", "running")
     failures: list[str] = []
     for mapping in mappings:
-        if mapping["action"] == "skip":
+        if mapping["action"] != "fill":
             continue
         ok, error = fill_field(page, mapping, resume_path)
         api.patch(
@@ -301,6 +398,90 @@ def process(api: Api, page: Page, application: dict[str, Any]) -> None:
         print("No confirmation found — not recorded as submitted.")
 
 
+def inspect_live(api: Api, page: Page, application: dict[str, Any]) -> None:
+    """JavaScript-rendered sites: read the live form and hand the fields back.
+
+    The web app then maps them against the user's data. Nothing is filled or
+    submitted here — this pass only reads.
+    """
+    application_id = application["id"]
+    print(f"\n=== Reading live form for run {application_id}")
+
+    step(api, application_id, "OPEN_JOB", "running")
+    page.goto(application["job_url"], wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(4000)
+
+    # Job description pages often reveal the form only after clicking Apply.
+    if len(page.evaluate(EXTRACT_FIELDS_JS)) < 3:
+        for name in ("Apply now", "Apply", "Apply for this job", "Start application"):
+            button = page.get_by_role("button", name=name, exact=False)
+            link = page.get_by_role("link", name=name, exact=False)
+            target = button if button.count() > 0 else link
+            if target.count() > 0:
+                try:
+                    target.first.click()
+                    page.wait_for_timeout(5000)
+                except Exception:
+                    pass
+                break
+
+    if looks_like_captcha(page) or looks_like_otp(page):
+        step(api, application_id, "HANDLE_VERIFICATION", "waiting", "Human verification required")
+        wait_for_human("Human verification required")
+        step(api, application_id, "HANDLE_VERIFICATION", "done", "Completed by you")
+
+    fields = page.evaluate(EXTRACT_FIELDS_JS)
+    step(api, application_id, "OPEN_JOB", "done", page.url)
+    step(api, application_id, "INSPECT_APPLICATION", "done", page.title())
+
+    if len(fields) < 3:
+        step(api, application_id, "EXTRACT_FIELDS", "failed", "No form found even in the live browser")
+        api.patch(
+            "applications",
+            f"id=eq.{application_id}",
+            {
+                "status": "needs_input",
+                "agent_state": "INSPECT_APPLICATION",
+                "notes": "Even in a real browser no application form was found on that page. "
+                "Open the site yourself, reach the actual form, and paste its URL as a new application.",
+            },
+        )
+        return
+
+    api.insert(
+        "field_mappings",
+        [
+            {
+                "user_id": application["user_id"],
+                "application_id": application_id,
+                "field_label": field["label"],
+                "field_selector": field["selector"],
+                "field_type": field["type"],
+                "is_required": field["required"],
+                "options": field["options"],
+                "source": "unavailable",
+                "confidence": 0,
+                "action": "needs_mapping",
+                "fill_status": "pending",
+            }
+            for field in fields
+        ],
+    )
+    step(api, application_id, "EXTRACT_FIELDS", "done", f"{len(fields)} fields read in the live browser")
+    api.patch(
+        "applications",
+        f"id=eq.{application_id}",
+        {
+            "status": "mapping_fields",
+            "agent_state": "MAP_FIELDS",
+            "job_url": page.url,
+            "page_snapshot": {"final_url": page.url, "title": page.title(), "field_count": len(fields), "js_rendered": True},
+            "notes": None,
+        },
+    )
+    print(f"Read {len(fields)} fields. Open the run in the app and choose 'Analyze detected fields'.")
+
+
 def main() -> None:
     api = Api()
     print("Worker signed in. Waiting for approved applications…")
@@ -318,13 +499,17 @@ def main() -> None:
                     time.sleep(POLL_SECONDS)
                     continue
                 application = pending[0]
+                inspect_only = application.get("agent_state") == "INSPECT_APPLICATION"
                 api.patch(
                     "applications",
                     f"id=eq.{application['id']}",
                     {"worker_claimed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                     "agent_state": "FILL_FIELDS"},
+                     "agent_state": application.get("agent_state") if inspect_only else "FILL_FIELDS"},
                 )
-                process(api, page, application)
+                if inspect_only:
+                    inspect_live(api, page, application)
+                else:
+                    process(api, page, application)
             except KeyboardInterrupt:
                 print("Stopping.")
                 sys.exit(0)

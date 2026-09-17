@@ -268,15 +268,104 @@ function RunBody() {
             </section>
           )}
 
+          {application.status === "mapping_fields" && (
+            <section className="panel border-primary/40 p-5">
+              <h2 className="mb-2 font-medium text-primary">Fields detected — ready to analyze</h2>
+              <p className="mb-4 text-sm text-muted-foreground">
+                Your browser worker read {mappings.length} fields from the live page. The agent will now
+                match them against your profile, resume and saved answers — and ask you about anything it
+                genuinely does not know.
+              </p>
+              <Button
+                disabled={busy}
+                onClick={async () => {
+                  setBusy(true);
+                  try {
+                    await run({ data: { applicationId: id } });
+                    await load();
+                  } catch (error) {
+                    toast.error(error instanceof Error ? error.message : "The agent could not continue.");
+                  } finally {
+                    setBusy(false);
+                  }
+                }}
+              >
+                {busy ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+                Analyze detected fields
+              </Button>
+            </section>
+          )}
+
           {application.status === "waiting_for_worker" && (
             <section className="panel border-primary/40 p-5">
-              <h2 className="mb-2 font-medium text-primary">Waiting for your browser worker</h2>
+              <h2 className="mb-2 font-medium text-primary">Ready to run — start your browser worker</h2>
               <p className="text-sm text-muted-foreground">
-                You approved this application. The real form filling, resume upload and submission happen in
-                a live browser on your machine — start the worker (see <code>worker/README.md</code>) and it
-                picks this run up. Nothing is marked submitted until the site's own confirmation is read
-                back.
+                {application.agent_state === "INSPECT_APPLICATION" ? (
+                  <>
+                    This site builds its form with JavaScript, so the app cannot read it on its own. Your
+                    browser worker opens the page in a real browser window on your computer, reads the live
+                    form, and hands the fields back here for analysis. Nothing is filled or submitted in this
+                    pass.
+                  </>
+                ) : (
+                  <>
+                    You approved this application. The real form filling, resume upload and submission happen
+                    in a live browser on your machine. Nothing is marked submitted until the site's own
+                    confirmation is read back.
+                  </>
+                )}
               </p>
+              <div className="mt-4 rounded-lg border border-border/60 p-4">
+                <p className="label-mono mb-2 text-primary">How to start the worker (on your computer)</p>
+                <ol className="list-decimal space-y-1.5 pl-5 text-sm text-muted-foreground">
+                  <li>
+                    Download the project from{" "}
+                    <a
+                      href="https://github.com/JAMESDEVARAPU/autoapply"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-primary hover:underline"
+                    >
+                      your GitHub repo
+                    </a>{" "}
+                    (Code → Download ZIP) and unzip it.
+                  </li>
+                  <li>
+                    Open the <code className="text-foreground">worker</code> folder and follow{" "}
+                    <code className="text-foreground">README.md</code> — it lists the 5 settings to fill in
+                    (including your sign-in email and password for this app).
+                  </li>
+                  <li>
+                    Run <code className="text-foreground">python worker.py</code> — a Chrome window opens and
+                    drives the job form while you watch.
+                  </li>
+                </ol>
+                <p className="mt-3 text-xs text-muted-foreground">
+                  There is no start button inside the app on purpose — the browser that fills the form runs on
+                  your machine, not here. While the worker is running, this page updates by itself every few
+                  seconds.
+                </p>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                className="mt-4"
+                disabled={busy}
+                onClick={async () => {
+                  setBusy(true);
+                  try {
+                    await run({ data: { applicationId: id } });
+                    await load();
+                    toast.success("Re-checked — still waiting for the worker to connect.");
+                  } catch (error) {
+                    toast.error(error instanceof Error ? error.message : "The agent could not continue.");
+                  } finally {
+                    setBusy(false);
+                  }
+                }}
+              >
+                <RefreshCw className="size-4" /> Re-check now
+              </Button>
             </section>
           )}
 
