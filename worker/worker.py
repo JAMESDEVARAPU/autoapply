@@ -21,16 +21,55 @@ from __future__ import annotations
 import os
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 import httpx
 from playwright.sync_api import sync_playwright, Page, TimeoutError as PWTimeout
 
-SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
-ANON_KEY = os.environ["SUPABASE_ANON_KEY"]
-EMAIL = os.environ["AGENT_EMAIL"]
-PASSWORD = os.environ["AGENT_PASSWORD"]
+
+def _load_env_file() -> None:
+    """Read config from a .env file sitting next to worker.py (beginner-friendly).
+
+    Real environment variables always win over the file.
+    """
+    env_path = Path(__file__).resolve().parent / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip().strip('"').strip("'")
+        if key and value and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_env_file()
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
+EMAIL = os.environ.get("AGENT_EMAIL", "")
+PASSWORD = os.environ.get("AGENT_PASSWORD", "")
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "10"))
+
+_missing = [
+    name
+    for name, val in [
+        ("SUPABASE_URL", SUPABASE_URL),
+        ("SUPABASE_ANON_KEY", ANON_KEY),
+        ("AGENT_EMAIL", EMAIL),
+        ("AGENT_PASSWORD", PASSWORD),
+    ]
+    if not val
+]
+if _missing:
+    sys.exit(
+        "Missing settings: "
+        + ", ".join(_missing)
+        + "\nCreate a file called .env in the worker folder (copy .env.example) and fill it in."
+    )
 
 CONFIRMATION_PHRASES = [
     "application submitted",
@@ -164,6 +203,31 @@ def step(api: Api, application_id: str, state: str, status: str, detail: str | N
     )
 
 
+def log(
+    api: Api,
+    application: dict[str, Any],
+    message: str,
+    level: str = "info",
+    stage: str | None = None,
+) -> None:
+    """Mirror the worker's console output into the app so the user can watch it there."""
+    print(f"[{level}] {message}")
+    try:
+        api.insert(
+            "worker_logs",
+            {
+                "user_id": application["user_id"],
+                "application_id": application["id"],
+                "level": level,
+                "stage": stage,
+                "message": message[:1000],
+            },
+        )
+    except Exception as error:  # noqa: BLE001 - never let logging break a run
+        print(f"(could not send log to the app: {error})")
+
+
+
 def wait_for_human(label: str) -> None:
     print(f"\n*** {label} ***")
     print("Complete it in the browser window that is open, then press Enter here.")
@@ -286,14 +350,18 @@ def process(api: Api, page: Page, application: dict[str, Any]) -> None:
                 resumes[0]["storage_path"], f"/tmp/{resumes[0]['file_name']}"
             )
 
+    log(api, application, f"Opening {application['job_url']}", stage="OPEN_JOB")
     step(api, application_id, "OPEN_JOB", "running")
     page.goto(application["job_url"], wait_until="domcontentloaded", timeout=60000)
     step(api, application_id, "OPEN_JOB", "done", page.url)
+    log(api, application, f"Page loaded: {page.title()[:120]}", stage="OPEN_JOB")
 
     if looks_like_captcha(page):
         step(api, application_id, "HANDLE_VERIFICATION", "waiting", "Human verification required")
+        log(api, application, "Human verification shown — waiting for you", "warn", "HANDLE_VERIFICATION")
         wait_for_human("Human verification required")
         step(api, application_id, "HANDLE_VERIFICATION", "done", "Completed by you")
+        log(api, application, "Human verification completed by you", stage="HANDLE_VERIFICATION")
 
     step(api, application_id, "FILL_FIELDS", "running")
     failures: list[str] = []
@@ -306,13 +374,24 @@ def process(api: Api, page: Page, application: dict[str, Any]) -> None:
             f"id=eq.{mapping['id']}",
             {"fill_status": "filled" if ok else "failed", "validation_error": error},
         )
+        log(
+            api,
+            application,
+            f"{'Filled' if ok else 'Could not fill'} “{mapping['field_label']}”"
+            + ("" if ok else f" — {error}"),
+            "info" if ok else "warn",
+            "FILL_FIELDS",
+        )
         if not ok and mapping["is_required"]:
             failures.append(f"{mapping['field_label']}: {error}")
         if mapping["field_type"] == "file" and ok:
             step(api, application_id, "UPLOAD_RESUME", "done", application.get("resume_file_name"))
+            log(api, application, f"Uploaded {application.get('resume_file_name')}", stage="UPLOAD_RESUME")
+
 
     if failures:
         step(api, application_id, "FILL_FIELDS", "failed", "; ".join(failures)[:500])
+        log(api, application, "Stopped: " + "; ".join(failures)[:400], "error", "FILL_FIELDS")
         api.patch(
             "applications",
             f"id=eq.{application_id}",
@@ -325,9 +404,11 @@ def process(api: Api, page: Page, application: dict[str, Any]) -> None:
         )
         return
     step(api, application_id, "FILL_FIELDS", "done", f"{len(mappings)} fields")
+    log(api, application, f"All {len(mappings)} fields handled", stage="FILL_FIELDS")
 
     if looks_like_otp(page):
         step(api, application_id, "HANDLE_VERIFICATION", "waiting", "One-time code required")
+        log(api, application, "One-time code required — waiting for you", "warn", "HANDLE_VERIFICATION")
         wait_for_human("One-time code required")
         step(api, application_id, "HANDLE_VERIFICATION", "done", "Entered by you")
 
@@ -338,14 +419,18 @@ def process(api: Api, page: Page, application: dict[str, Any]) -> None:
         if button.count() > 0:
             button.first.click()
             submitted = True
+            log(api, application, f"Clicked the site's “{name}” button", stage="SUBMIT")
             break
+
     if not submitted:
         step(api, application_id, "SUBMIT", "failed", "No submit button was found on the page")
+        log(api, application, "No submit button was found on the page", "error", "SUBMIT")
         api.patch(
             "applications",
             f"id=eq.{application_id}",
             {"status": "failed", "notes": "The submit button could not be found on the live page."},
         )
+
         return
 
     page.wait_for_timeout(6000)
@@ -376,7 +461,9 @@ def process(api: Api, page: Page, application: dict[str, Any]) -> None:
                 "detail": confirmation,
             },
         )
+        log(api, application, f"Site confirmed: “{confirmation}”", stage="VERIFY_SUBMISSION")
         print("Submitted and confirmed by the site.")
+
     else:
         step(
             api,
@@ -395,7 +482,15 @@ def process(api: Api, page: Page, application: dict[str, Any]) -> None:
                 "Check the browser window before applying again.",
             },
         )
+        log(
+            api,
+            application,
+            "Submit was clicked but the site showed no confirmation — not recorded as submitted",
+            "error",
+            "VERIFY_SUBMISSION",
+        )
         print("No confirmation found — not recorded as submitted.")
+
 
 
 def inspect_live(api: Api, page: Page, application: dict[str, Any]) -> None:
@@ -407,9 +502,11 @@ def inspect_live(api: Api, page: Page, application: dict[str, Any]) -> None:
     application_id = application["id"]
     print(f"\n=== Reading live form for run {application_id}")
 
+    log(api, application, f"Opening {application['job_url']} to read the live form", stage="OPEN_JOB")
     step(api, application_id, "OPEN_JOB", "running")
     page.goto(application["job_url"], wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(4000)
+
 
     # Job description pages often reveal the form only after clicking Apply.
     if len(page.evaluate(EXTRACT_FIELDS_JS)) < 3:
@@ -427,15 +524,18 @@ def inspect_live(api: Api, page: Page, application: dict[str, Any]) -> None:
 
     if looks_like_captcha(page) or looks_like_otp(page):
         step(api, application_id, "HANDLE_VERIFICATION", "waiting", "Human verification required")
+        log(api, application, "Human verification shown — waiting for you", "warn", "HANDLE_VERIFICATION")
         wait_for_human("Human verification required")
         step(api, application_id, "HANDLE_VERIFICATION", "done", "Completed by you")
 
     fields = page.evaluate(EXTRACT_FIELDS_JS)
     step(api, application_id, "OPEN_JOB", "done", page.url)
     step(api, application_id, "INSPECT_APPLICATION", "done", page.title())
+    log(api, application, f"Read {len(fields)} fields on {page.url}", stage="EXTRACT_FIELDS")
 
     if len(fields) < 3:
         step(api, application_id, "EXTRACT_FIELDS", "failed", "No form found even in the live browser")
+        log(api, application, "No application form found even in a real browser", "error", "EXTRACT_FIELDS")
         api.patch(
             "applications",
             f"id=eq.{application_id}",
@@ -447,6 +547,7 @@ def inspect_live(api: Api, page: Page, application: dict[str, Any]) -> None:
             },
         )
         return
+
 
     api.insert(
         "field_mappings",
